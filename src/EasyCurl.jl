@@ -48,10 +48,11 @@ abstract type AbstractCurlError <: Exception end
 
 # COV_EXCL_START
 function Base.showerror(io::IO, e::AbstractCurlError)
-    if !isempty(e.libcurl_message)
-        print(io, nameof(typeof(e)), "{", e.code, "}: ", e.libcurl_message)
-    else
-        print(io, nameof(typeof(e)), "{", e.code, "}: ", e.message)
+    msg = !isempty(e.libcurl_message) ? e.libcurl_message : e.message
+    print(io, nameof(typeof(e)), "{", e.code, "}: ", msg)
+    if e.diagnostics !== nothing
+        print(io, '\n')
+        show(io, e.diagnostics)
     end
 end
 # COV_EXCL_STOP
@@ -60,69 +61,36 @@ end
     if buf === nothing || buf[1] == 0x00
         return ""
     end
-    n0  = findfirst(==(0x00), buf)
+    n0 = findfirst(==(0x00), buf)
     raw = String(n0 === nothing ? buf : @view buf[1:n0-1])
     msg = chomp(strip(raw))
     return msg
 end
 
-"""
-    CurlEasyError <: AbstractCurlError
-
-Represents an error from a libcurl easy interface call.
-
-## Fields
-- `code::Int`: The libcurl error code.
-- `message::String`: The corresponding error message from libcurl.
-
-## Examples
-
-```julia-repl
-julia> curl_easy_setopt(c, 1, 1)
-ERROR: CurlEasyError{48}: An unknown option was passed in to libcurl
-```
-"""
-struct CurlEasyError{code} <: AbstractCurlError
-    code::Int
-    message::String
-    libcurl_message::String
-
-    function CurlEasyError(c::Integer, curl)
-        msg = unsafe_string(LibCURL.curl_easy_strerror(UInt32(c)))
-        buf = _errorbuffer_msg(curl.error_buffer)
-        return new{Int(c)}(Int(c), msg, buf)
-    end
+Base.@kwdef struct ReqSnapshot
+    method::String
+    url::String
+    headers::Vector{Pair{String,String}}
+    proxy::Union{String,Nothing}
+    interface::Union{String,Nothing}
+    version::Union{UInt,Nothing}
+    connect_timeout::Float64
+    read_timeout::Float64
+    body_len::Int
 end
 
-"""
-    CurlMultiError <: AbstractCurlError
-
-Represents an error from a libcurl multi interface call.
-
-## Fields
-- `code::Int`: The libcurl multi error code.
-- `message::String`: The corresponding error message from libcurl.
-
-## Examples
-
-```julia-repl
-julia> curl_multi_add_handle(c)
-ERROR: CurlMultiError{1}: Invalid multi handle
-```
-"""
-struct CurlMultiError{code} <: AbstractCurlError
-    code::Int
-    message::String
-    libcurl_message::String
-
-    function CurlMultiError(c::Integer, curl)
-        msg = unsafe_string(LibCURL.curl_multi_strerror(UInt32(c)))
-        buf = _errorbuffer_msg(curl.error_buffer)
-        return new{Int(c)}(Int(c), msg, buf)
-    end
+struct CurlDiagnostics
+    req::Union{Nothing,ReqSnapshot}
+    effective_url::Union{Nothing,String}
+    primary_ip::Union{Nothing,String}
+    local_ip::Union{Nothing,String}
+    primary_port::Union{Nothing,Int}
+    local_port::Union{Nothing,Int}
+    time_total::Union{Nothing,Float64}
+    time_connect::Union{Nothing,Float64}
+    time_app_connect::Union{Nothing,Float64}
+    time_name_lookup::Union{Nothing,Float64}
 end
-
-
 
 """
     CurlClient
@@ -140,11 +108,11 @@ mutable struct CurlClient
 
     function CurlClient()
         easy_handle = LibCURL.curl_easy_init()
-        easy_handle != C_NULL || begin 
+        easy_handle != C_NULL || begin
             throw(ArgumentError("curl_easy_init failed"))
         end
         multi_handle = LibCURL.curl_multi_init()
-        multi_handle != C_NULL || begin 
+        multi_handle != C_NULL || begin
             LibCURL.curl_easy_cleanup(easy_handle)
             throw(ArgumentError("curl_multi_init failed"))
         end
@@ -156,10 +124,218 @@ mutable struct CurlClient
             throw(ArgumentError("failed to set CURLOPT_ERRORBUFFER"))
         end
 
-        c = new(easy_handle,multi_handle, buf)
+        c = new(easy_handle, multi_handle, buf)
         finalizer(close, c)
         return c
     end
+end
+
+function CurlDiagnostics(curl::CurlClient)
+    ctx_ref = Ref{CurlResponseContext}()
+    r = LibCURL.curl_easy_getinfo(curl.easy_handle, CURLINFO_PRIVATE, ctx_ref)
+    snapshot = (r == CURLE_OK) ? ctx_ref[].req_snapshot : nothing
+    return CurlDiagnostics(
+        snapshot,
+        _get_strinfo(curl, CURLINFO_EFFECTIVE_URL),
+        _get_strinfo(curl, CURLINFO_PRIMARY_IP),
+        _get_strinfo(curl, CURLINFO_LOCAL_IP),
+        _get_typedinfo(Clong, curl, CURLINFO_PRIMARY_PORT),
+        _get_typedinfo(Clong, curl, CURLINFO_LOCAL_PORT),
+        _get_typedinfo(Cdouble, curl, CURLINFO_TOTAL_TIME),
+        _get_typedinfo(Cdouble, curl, CURLINFO_CONNECT_TIME),
+        _get_typedinfo(Cdouble, curl, CURLINFO_APPCONNECT_TIME),
+        _get_typedinfo(Cdouble, curl, CURLINFO_NAMELOOKUP_TIME)
+    )
+end
+
+function _curlfmt_split_url(u::AbstractString)
+    m = match(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://([^/ :]+)(?::(\d+))?(/.*)?$", u)
+    if isnothing(m)
+        return nothing, nothing, nothing, u
+    end
+    scheme = m.captures[1]
+    host = m.captures[2]
+    port = m.captures[3] === nothing ? nothing : tryparse(Int, m.captures[3])
+    pathq = something(m.captures[4], "/")
+    return scheme, host, port, pathq
+end
+
+function _curlfmt_http_version(v)
+    v === nothing && return "?.?"
+    try
+        return Base.get(HTTP_VERSION_MAP, UInt64(v), "?.?")
+    catch
+        return "?.?"
+    end
+end
+
+_curlfmt_time(x) = x === nothing ? "?\\" : string(round(x, digits = 3))
+
+function _curlfmt_print_request_meta(io::IO, s::ReqSnapshot, scheme)
+    println(io, "* EasyCurl diagnostics")
+    println(io, "* URL: ", s.url)
+    println(io, "* Method: ", s.method)
+    !isnothing(scheme) && println(io, "* Protocol: ", scheme)
+    s.proxy !== nothing && println(io, "* Proxy: ", s.proxy)
+    s.interface !== nothing && println(io, "* Interface: ", s.interface)
+    println(io, "* Connect timeout: $(s.connect_timeout) s")
+    println(io, "* Read timeout: $(s.read_timeout) s")
+    s.version !== nothing && println(io, "* Requested HTTP version: ", s.version)
+end
+
+function _curlfmt_print_connect_preamble(io::IO, d::CurlDiagnostics, host)
+    if d.primary_ip !== nothing && d.primary_port !== nothing
+        println(io, "* Trying $(d.primary_ip):$(d.primary_port)...")
+    end
+    if host !== nothing && d.primary_ip !== nothing && d.primary_port !== nothing && !isempty(d.primary_ip) && d.primary_port != 0
+        println(io, "* Connected to $(host) ($(d.primary_ip)) port $(d.primary_port) (#0)")
+    end
+end
+
+function _curlfmt_print_request(io::IO, s::ReqSnapshot, host, port, pathq)
+    httpver = _curlfmt_http_version(s.version)
+    path = pathq === nothing ? "/" : pathq
+    println(io, "> ", s.method, " ", path, " HTTP/", httpver)
+    if host !== nothing
+        if port === nothing
+            println(io, "> Host: ", host)
+        else
+            println(io, "> Host: ", host, ":", port)
+        end
+    end
+    for (k, v) in _redact_headers(s.headers)
+        println(io, "> ", k, ": ", v)
+    end
+    println(io, ">")
+end
+
+function _curlfmt_print_body_len(io::IO, s::ReqSnapshot)
+    println(io, "* Body length: ", s.body_len)
+end
+
+function _curlfmt_print_endpoints(io::IO, d::CurlDiagnostics)
+    lip = d.local_ip === nothing ? "?\\" : d.local_ip
+    lport = d.local_port === nothing ? "?\\" : string(d.local_port)
+    rip = d.primary_ip === nothing ? "?\\" : d.primary_ip
+    rport = d.primary_port === nothing ? "?\\" : string(d.primary_port)
+
+    if d.local_ip !== nothing || d.primary_ip !== nothing
+        println(io, "* Local: ", lip, ":", lport)
+        println(io, "* Remote: ", rip, ":", rport)
+    end
+    d.effective_url !== nothing && println(io, "* Effective URL: ", d.effective_url)
+end
+
+function _curlfmt_print_timings(io::IO, d::CurlDiagnostics)
+    println(io, "* Namelookup: ", _curlfmt_time(d.time_name_lookup), " s")
+    println(io, "* Connect: ", _curlfmt_time(d.time_connect), " s")
+    println(io, "* AppConnect: ", _curlfmt_time(d.time_app_connect), " s")
+    println(io, "* Total: ", _curlfmt_time(d.time_total), " s")
+end
+
+function Base.show(io::IO, d::CurlDiagnostics)
+    if d.req !== nothing
+        s = d.req::ReqSnapshot
+        scheme, host, port, pathq = _curlfmt_split_url(s.url)
+        _curlfmt_print_request_meta(io, s, scheme)
+        _curlfmt_print_connect_preamble(io, d, host)
+        _curlfmt_print_request(io, s, host, port, pathq)
+        _curlfmt_print_body_len(io, s)
+    else
+        println(io, "* EasyCurl diagnostics")
+        println(io, "* (no request snapshot)")
+    end
+
+    _curlfmt_print_endpoints(io, d)
+    _curlfmt_print_timings(io, d)
+    return nothing
+end
+
+"""
+    CurlEasyError <: AbstractCurlError
+
+Represents an error from a libcurl easy interface call.
+
+## Fields
+- `code::Int`: The libcurl error code.
+- `message::String`: The corresponding error message from libcurl.
+- `diagnostics::CurlDiagnostics`: diagnostic struct, that will contain virtually all context info if available
+
+## Examples
+
+```julia-repl
+julia> curl_easy_setopt(c, 1, 1)
+ERROR: CurlEasyError{48}: An unknown option was passed in to libcurl
+```
+"""
+struct CurlEasyError{code} <: AbstractCurlError
+    code::Int
+    message::String
+    libcurl_message::String
+    diagnostics::CurlDiagnostics
+
+    function CurlEasyError(c::Integer, curl)
+        msg = unsafe_string(LibCURL.curl_easy_strerror(UInt32(c)))
+        buf = _errorbuffer_msg(curl.error_buffer)
+        diag = CurlDiagnostics(curl)
+        return new{Int(c)}(Int(c), msg, buf, diag)
+    end
+end
+
+"""
+    CurlMultiError <: AbstractCurlError
+
+Represents an error from a libcurl multi interface call.
+
+## Fields
+- `code::Int`: The libcurl multi error code.
+- `message::String`: The corresponding error message from libcurl.
+- `diagnostics::CurlDiagnostics`: diagnostic struct, that will contain virtually all context info if available
+
+## Examples
+
+```julia-repl
+julia> curl_multi_add_handle(c)
+ERROR: CurlMultiError{1}: Invalid multi handle
+```
+"""
+struct CurlMultiError{code} <: AbstractCurlError
+    code::Int
+    message::String
+    libcurl_message::String
+    diagnostics::CurlDiagnostics
+
+    function CurlMultiError(c::Integer, curl)
+        msg = unsafe_string(LibCURL.curl_multi_strerror(UInt32(c)))
+        buf = _errorbuffer_msg(curl.error_buffer)
+        diag = CurlDiagnostics(curl)
+        return new{Int(c)}(Int(c), msg, buf, diag)
+    end
+end
+
+@inline function _get_strinfo(c::CurlClient, info::CURLINFO)
+    ref = Ref{Cstring}()
+    r_code = LibCURL.curl_easy_getinfo(c.easy_handle, info, ref)
+    r_code == CURLE_OK || return nothing
+    p = ref[]
+    return p == C_NULL ? nothing : unsafe_string(p)
+end
+
+@inline function _get_typedinfo(::Type{T}, c::CurlClient, info::CURLINFO) where {T}
+    r = Ref{T}()
+    r_code = LibCURL.curl_easy_getinfo(c.easy_handle, info, r)
+    r_code == CURLE_OK && return r[]
+    return nothing
+end
+
+function _redact_headers(h::Vector{Pair{String,String}})
+    secrets = Set(["authorization", "proxy-authorization", "cookie", "set-cookie"])
+    out = Pair{String,String}[]
+    for (k, v) in h
+        concealed = lowercase(k) in secrets ? "<redacted>" : v
+        push!(out, k => concealed)
+    end
+    return out
 end
 
 function curl_cleanup(c::CurlClient)
@@ -277,7 +453,9 @@ function curl_multi_perform(c::CurlClient)
         if mc != CURLM_OK
             throw(CurlMultiError(mc, c))
         end
-        isnothing(r_ctx.error) || throw(r_ctx.error)
+        if r_ctx !== nothing
+            isnothing(r_ctx.error) || throw(r_ctx.error)
+        end
     end
 
     while true
@@ -315,23 +493,20 @@ end
 
 function get_private_data(c::CurlClient, ::Type{T})::T where {T}
     private_ref = Ref{T}()
-    curl_easy_getinfo(c, CURLINFO_PRIVATE, private_ref)
-    return private_ref[]
+    r = LibCURL.curl_easy_getinfo(c.easy_handle, CURLINFO_PRIVATE, private_ref)
+    return r == CURLE_OK ? private_ref[] : nothing
     # return unsafe_pointer_to_objref(ptr_ref[])::T
 end
 
-mutable struct CurlResponseContext
-    status::Int
-    version::Int
-    total_time::Float64
-    stream::IOBuffer
-    headers::Vector{Pair{String,String}}
-    on_data::Union{Nothing,Function}
-    error::Union{Nothing,Exception}
-
-    function CurlResponseContext(on_data::Union{Nothing,Function})
-        return new(0, 0, 0.0, IOBuffer(; append = true), Vector{Pair{String,String}}(), on_data, nothing)
-    end
+Base.@kwdef mutable struct CurlResponseContext
+    status::Int = 0
+    version::Int = 0
+    total_time::Float64 = 0.0
+    stream::IOBuffer = IOBuffer(; append = true)
+    headers::Vector{Pair{String,String}} = []
+    on_data::Union{Nothing,Function} = nothing
+    error::Union{Nothing,Exception} = nothing
+    req_snapshot::Union{Nothing,ReqSnapshot} = nothing
 end
 
 function write_callback(buf::Ptr{UInt8}, s::Csize_t, n::Csize_t, p_ctxt::Ptr{Cvoid})
@@ -363,5 +538,3 @@ include("protocols/HTTP.jl")
 include("protocols/IMAP.jl")
 
 end
-
-

@@ -27,9 +27,7 @@ export CURL_HTTP_VERSION_NONE,
     CURL_HTTP_VERSION_1_1,
     CURL_HTTP_VERSION_2_0,
     CURL_HTTP_VERSION_2TLS,
-    CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE,
-    CURL_HTTP_VERSION_3,
-    CURL_HTTP_VERSION_3ONLY
+    CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE
 
 """
     HTTP_VERSION_MAP::Dict{UInt64,String}
@@ -41,9 +39,12 @@ Maps CURL numerical constants for HTTP versions to their string representations.
 - `0x00000003` (`CURL_HTTP_VERSION_2_0`) - `"2.0"`: HTTP 2.0
 """
 const HTTP_VERSION_MAP = Dict{UInt64,String}(
+    CURL_HTTP_VERSION_NONE => "?.?",
     CURL_HTTP_VERSION_1_0 => "1.0",
     CURL_HTTP_VERSION_1_1 => "1.1",
     CURL_HTTP_VERSION_2_0 => "2.0",
+    CURL_HTTP_VERSION_2TLS => "2.0",
+    CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE => "2.0"
 )
 
 """
@@ -78,14 +79,14 @@ curl_total_time(x::HTTPResponse) = http_total_time(x)
 curl_body(x::HTTPResponse) = http_body(x)
 
 function HTTPResponse(x::CurlResponseContext)
-    return HTTPResponse(x.status, x.version, x.total_time, take!(x.stream), x.headers,)
+    return HTTPResponse(x.status, x.version, x.total_time, take!(x.stream), x.headers)
 end
 
 # COV_EXCL_START
 function Base.show(io::IO, x::HTTPResponse)
     println(io, HTTPResponse)
     println(io, "\"\"\"")
-    print(io, "HTTP/", Base.get(HTTP_VERSION_MAP, http_version(x), "1.1"))
+    print(io, "HTTP/", Base.get(HTTP_VERSION_MAP, http_version(x), "?.?"))
     println(io, " ", http_status(x), " ", Base.get(HTTP_STATUS_CODES, x.status, ""))
     for (k, v) in http_headers(x)
         println(io, "$k: '$v'")
@@ -347,9 +348,12 @@ function perform_request(c::CurlClient, r::HTTPRequest)
 
         curl_multi_perform(c)
     finally
-        r.response_context.version = get_http_version(c)
-        r.response_context.status = get_http_response_status(c)
-        r.response_context.total_time = get_total_time(c)
+        try
+            r.response_context.version = get_http_version(c)
+            r.response_context.status = get_http_response_status(c)
+            r.response_context.total_time = get_total_time(c)
+        catch
+        end
         curl_multi_remove_handle(c)
         curl_easy_reset(c)
     end
@@ -428,7 +432,7 @@ function http_request(
     retry::Int64 = 0,
     retry_delay::Real = 0.25,
     f::Union{Function,Nothing} = nothing,
-    options...,
+    options...
 )::HTTPResponse
     with_retry(retry, retry_delay) do
         req = HTTPRequest(
@@ -438,7 +442,18 @@ function http_request(
             Vector{UInt8}(body),
             HTTPOptions(; options...),
             C_NULL,
-            CurlResponseContext(f),
+            CurlResponseContext(; on_data = f),
+        )
+        req.response_context.req_snapshot = ReqSnapshot(;
+            method = req.method,
+            url = req.url,
+            headers = copy(req.headers),
+            proxy = req.options.proxy,
+            interface = req.options.interface,
+            version = req.options.version,
+            connect_timeout = req.options.connect_timeout,
+            read_timeout = req.options.read_timeout,
+            body_len = length(req.body)
         )
         try
             perform_request(client, req)
